@@ -1,203 +1,177 @@
-# Proposal: Gremlin Task Large Result Chunking
+## [Improve] Gremlin Task Large Result Chunking
 
-## Summary
+### Before submit
+- [x] I have confirmed and searched that there are no similar problems in the historical issue and documents
 
-When a Gremlin async task returns large results, the entire result set is JSON-serialized, compressed, and stored as a single vertex property (`~task_result`). This has three bottlenecks: memory (full ArrayList in GremlinJob), storage (16 MB single-property limit), and API retrieval (full decompress + deserialize on every `GET /tasks/{id}`). This proposal introduces chunked storage and paginated retrieval for large Gremlin task results.
+---
 
-## Motivation
+### Environment
 
-PR [#3060] (merged) added metadata-only task reads and `with_result=false` support, making task listing and deletion usable when large historical results exist. That PR explicitly deferred result chunking:
+- HugeGraph version: 1.8.0+
+- Java version: 11+
+- Module: `hugegraph-core` (task framework), `hugegraph-api` (REST), `hugegraph-test`
+- Related PR: #3060 (task metadata reads + `with_result=false`)
 
-> *"large Gremlin result export/chunking can be handled separately"*
+---
 
-This proposal is the natural follow-up: handle the case where the user *does* want the result, but the result is too large to serve as a single blob.
+### Problem Description
 
-### Current result data flow
-
-```
-GremlinJob.execute()
-  → List<Object> results = new ArrayList<>()    // all in memory, 800K cap
-  → return results                               // full list
-      ↓
-HugeTask.set(v)   [line 372]
-  → String result = JsonUtil.toJson(v)           // full JSON serialization
-  → checkPropertySize(result, P.RESULT)          // 16 MB default limit
-  → this.result = result                         // stored as volatile String
-      ↓
-HugeTask.asArray()   [line 568]
-  → byte[] bytes = StringEncoding.compress(result)   // compress
-  → checkPropertySize(bytes.length, P.RESULT)        // check again
-  → list.add(P.RESULT); list.add(bytes)              // single vertex property
-      ↓
-StandardTaskScheduler.save()   [line 464]
-  → constructVertex(task) → addVertex(vertex)    // written to backend store
-      ↓
-GET /tasks/{id}?with_result=true   [TaskAPI line 141]
-  → full decompress + deserialize → return entire JSON
-```
-
-### Bottlenecks
+When a Gremlin async task returns large results (e.g., a `g.V().valueMap()` query on a graph with millions of vertices), the entire result set is JSON-serialized, compressed, and stored as a **single** vertex property (`~task_result`). This has three compounding bottlenecks:
 
 | Bottleneck | Code location | Current limit |
 |---|---|---|
-| Result item count | `GremlinJob.TASK_RESULTS_MAX_SIZE` | `Query.DEFAULT_CAPACITY` = 800,000 |
-| Compressed storage | `CoreOptions.TASK_RESULT_SIZE_LIMIT` | 16 MB (default), 1 GB (max) |
+| Result item count | `GremlinJob.TASK_RESULTS_MAX_SIZE` | 800,000 (hardcoded to `Query.DEFAULT_CAPACITY`) |
+| Compressed storage size | `CoreOptions.TASK_RESULT_SIZE_LIMIT` | 16 MB (default) |
 | Single property maximum | `BytesBuffer.BYTES_LEN_MAX` | 10 MB |
 
-## Proposed Solution
+**Current behavior (GremlinJob.execute):**
+```
+List<Object> results = new ArrayList<>();
+while (traversal.hasNext()) {
+    results.add(traversal.next());    // all in memory, up to 800K entries
+    checkResultsSize(results);
+}
+return results;  // full list -> HugeTask.set() -> JSON serialize -> compress -> single ~task_result
+```
 
-### Phase 1: Chunked storage (backward compatible)
+**Actual problems:**
 
-When the JSON-serialized result exceeds a configurable threshold (default: 1 MB), split it into chunks and store them as separate vertex properties instead of a single `~task_result`.
+1. A query returning 500K vertices with 10 properties each produces a ~50MB JSON string. `JsonUtil.toJson(result)` serializes it all in memory. If the compressed result exceeds `TASK_RESULT_SIZE_LIMIT` (16MB default), a `LimitExceedException` is thrown and the task fails.
+
+2. On `GET /tasks/{id}?with_result=true`, the entire `~task_result` blob is decompressed and deserialized. For a 50MB result, this takes seconds and can cause timeout on slow connections, especially with the RocksDB backend where the blob is read through multiple serialization layers.
+
+3. Users cannot incrementally consume large results. The only option is to increase `task.result_size_limit` (up to 1GB) and accept the memory/performance cost.
+
+**Expected behavior:**
+
+1. Large task results are stored in configurable-size chunks, each stored as a separate vertex property.
+2. The REST API supports paginated retrieval: `GET /tasks/{id}?with_result=true&page=0&page_size=1000`.
+3. Small results (< chunk threshold) continue to use the existing single-property path — fully backward compatible.
+
+---
+
+### Root Cause Analysis
+
+The root cause is in `HugeTask.asArray()` (line 568) and `HugeTask.set()` (line 372):
+
+```java
+// HugeTask.set() - result is set as a single string
+protected void set(V v) {
+    String result = JsonUtil.toJson(v);          // full JSON in one string
+    checkPropertySize(result, P.RESULT);         // 16MB check
+    this.result = result;
+    super.set(v);
+}
+
+// HugeTask.asArray() - stored as a single vertex property
+if (this.result != null) {
+    byte[] bytes = StringEncoding.compress(this.result);  // single blob
+    checkPropertySize(bytes.length, P.RESULT);
+    list.add(P.RESULT);
+    list.add(bytes);
+}
+```
+
+The task vertex property model already supports multiple properties (it uses a `List<Object>` key-value pair list). The limitation is purely in the serialization code — there is no splitting logic. PR #3060 added `asArrayWithoutResult()` for the metadata-only path but left the result storage unchanged.
+
+---
+
+### Proposed Solution
+
+**Phase 1: Chunked Storage**
+
+When `this.result` (the JSON string) exceeds a configurable threshold `task.result_chunk_size` (default: 1 MB), split it into chunks and store as `~task_result_0`, `~task_result_1`, ... instead of a single `~task_result`.
 
 **Storage model:**
-
 ```
-Small result (≤ threshold):
-  ~task_result = <compressed full result>           // unchanged, backward compat
+Small result (<= 1 MB):
+  ~task_result = <compressed full result>           // UNCHANGED
 
-Large result (> threshold):
-  ~task_result_0   = <compressed chunk 0>           // new
-  ~task_result_1   = <compressed chunk 1>
-  ~task_result_2   = <compressed chunk 2>
-  ...
-  ~task_result_n   = <chunk_count>                  // metadata marker
+Large result (> 1 MB):
+  ~task_result_0 = <compressed chunk 0>             // NEW
+  ~task_result_1 = <compressed chunk 1>
+  ~task_result_2 = <compressed chunk 2>
+  ~task_result_n = <chunk_count>                    // metadata marker
 ```
 
-The property naming uses sequential numeric suffixes. The chunk count is stored in the last chunk as a marker, so the reader knows how many chunks to expect without scanning all properties.
+**Phase 2: Paginated API**
 
-### Phase 2: Paginated API retrieval
-
+Add `page` and `page_size` query parameters to `GET /tasks/{id}`:
 ```
 GET /tasks/{id}?with_result=true&page=0&page_size=1000
 ```
+Response includes pagination metadata (`page`, `page_size`, `total`). When `page_size` is absent, the full result is returned (reassembled from chunks if needed) — backward compatible.
 
-New query parameters:
-- `page` (default: 0) — which page of results to return
-- `page_size` (default: null, meaning "all") — items per page
+**Phase 3 (Future): Streaming Write**
 
-Response for paginated results:
-```json
-{
-  "id": 123,
-  "type": "gremlin",
-  "status": "success",
-  "task_result": [ ... items for page 0 ... ],
-  "pagination": {
-    "page": 0,
-    "page_size": 1000,
-    "total": 50000
-  }
-}
-```
+Modify `GremlinJob.execute()` to write results in batches to avoid holding the full list in memory. Deferred to keep this task scoped.
 
-When `page_size` is absent, behavior is unchanged — return the full result (reassembled from chunks if needed).
+**Key design constraints:**
+1. Backward compatibility: existing single-property tasks continue to work
+2. Cross-backend: all changes at the vertex property abstraction level — works across RocksDB, MySQL, PostgreSQL, Cassandra, HBase
+3. JSON-level chunking: split at JSON array element boundaries, not arbitrary byte offsets
 
-### Phase 3 (future): Streaming write from GremlinJob
-
-Modify `GremlinJob.execute()` to write results to `HugeTask` in batches instead of holding the entire list in memory. This removes the 800K item count limit and the memory bottleneck. Deferred to a follow-up to keep this proposal scoped.
-
-## Implementation Plan
-
-### Files to modify
+### Files to Modify
 
 | File | LOC | Changes |
 |---|---|---|
-| `hugegraph-core/.../task/HugeTask.java` | 873 | Chunked property names, split logic in `asArray()`, reassembly in `property()`, pagination in `asMap()` |
-| `hugegraph-api/.../api/job/TaskAPI.java` | 222 | `page` and `page_size` query params, response format |
-| `hugegraph-core/.../config/CoreOptions.java` | 742 | New config: `task.result_chunk_size` |
-| `hugegraph-test/.../core/TaskCoreTest.java` | 816 | Tests for chunked storage and paginated retrieval |
-| `hugegraph-test/.../api/TaskApiTest.java` | 189 | API pagination tests |
+| `hugegraph-core/.../task/HugeTask.java` | 873 | Chunked property read/write, reassembly, pagination |
+| `hugegraph-api/.../api/job/TaskAPI.java` | 222 | `page`, `page_size` query params, new response format |
+| `hugegraph-core/.../config/CoreOptions.java` | 742 | New config: `task.result_chunk_size` (1 MB default) |
+| `hugegraph-test/.../core/TaskCoreTest.java` | 816 | Unit tests: chunked storage, reassembly, pagination, backward compat |
+| `hugegraph-test/.../api/TaskApiTest.java` | 189 | API integration tests for pagination |
 
-### Key design decisions
+---
 
-1. **Backward compatibility is mandatory.** Existing stored tasks with single `~task_result` must continue to work. The chunked format is only used for new saves.
+### Impact
 
-2. **Chunk size is configurable.** `task.result_chunk_size` with default 1 MB (1,048,576 bytes). This keeps individual vertex properties small while not generating excessive property counts.
+```
+BEFORE - Large Gremlin task result (> 16MB):
+  T=0   GremlinJob loads all results into ArrayList
+  T=1   JsonUtil.toJson(result) fails or exceeds 16MB limit
+  T=2   Task status: FAILED / "Task result size exceeded limit"
+  User sees: 500 Internal Server Error
 
-3. **JSON-level chunking, not byte-level.** Chunks are split at the JSON array boundary (item-level), not at arbitrary byte offsets. This ensures each chunk is valid JSON and can be independently parsed.
-
-4. **No change to GremlinJob execution.** Phase 1-2 only changes storage and retrieval. The execution path (loading results into ArrayList) is unchanged for now, keeping risk low.
-
-5. **No new storage schema.** Chunks use the existing vertex property mechanism. No new tables, no migration scripts needed.
-
-### Chunk split algorithm
-
-```java
-// In HugeTask.asArray(), after JSON serialization:
-String resultJson = this.result;  // the JSON-serialized result list
-if (resultJson.length() > chunkSizeThreshold) {
-    // Split the result into chunks
-    // For array results: split at top-level array element boundaries
-    // For single-object results: split raw bytes at chunk boundaries
-    List<String> chunks = splitResult(resultJson, chunkSizeThreshold);
-    for (int i = 0; i < chunks.size(); i++) {
-        byte[] compressed = StringEncoding.compress(chunks.get(i));
-        list.add("~task_result_" + i);
-        list.add(compressed);
-    }
-} else {
-    // Original single-property path (unchanged)
-    list.add(P.RESULT);
-    list.add(StringEncoding.compress(this.result));
-}
+AFTER - Large Gremlin task result (> 16MB):
+  T=0   GremlinJob loads results (unchanged for Phase 1-2)
+  T=1   JsonUtil.toJson(result) succeeds
+  T=2   HugeTask.asArray() splits result into 1MB chunks
+  T=3   Stored as ~task_result_0 ... ~task_result_N
+  User sees: GET /tasks/{id}?page=0&page_size=1000 -> first 1000 items
 ```
 
-### Pagination algorithm
+---
 
-```java
-// In HugeTask.asMap(withResult=true, page=0, pageSize=1000):
-List<Object> allResults;
-if (isChunked(vertex)) {
-    allResults = reassembleChunkedResult(vertex);
-} else {
-    allResults = parseSingleResult(vertex);
-}
-// Apply pagination
-int start = page * pageSize;
-int end = Math.min(start + pageSize, allResults.size());
-return ImmutableMap.of(
-    "task_result", allResults.subList(start, end),
-    "pagination", ImmutableMap.of(
-        "page", page, "page_size", pageSize, "total", allResults.size()
-    )
-);
-```
+### Related
 
-## Testing Strategy
-
-### Unit tests (TaskCoreTest)
-
-1. `testTaskResultChunked()` — verify result is stored as multiple properties when > threshold
-2. `testTaskResultSmall()` — verify small results still use single property
-3. `testTaskResultChunkReassembly()` — verify chunks are correctly reassembled
-4. `testTaskResultPagination()` — verify page/page_size works with chunked results
-5. `testTaskResultBackwardCompat()` — verify old single-property tasks still work
-6. `testTaskResultSameAsBefore()` — verify reassembled chunked result equals original
-
-### API tests (TaskApiTest)
-
-1. `testGetWithPagination()` — verify `page` and `page_size` query params
-2. `testGetPaginationMetadata()` — verify `total`, `page_size` in response
-3. `testGetWithoutPagination()` — verify backward compat (no page params = full result)
-
-## Risks and Mitigations
-
-| Risk | Mitigation |
+| Issue/PR | Description |
 |---|---|
-| Breaking existing stored tasks | Single-property path unchanged; chunk detection is additive |
-| Property count explosion | 1 MB chunks → max ~16 chunks at 16 MB limit; well under vertex property limits (UINT16_MAX) |
-| Cross-backend compatibility | All changes at HugeTask level, which uses vertex property abstraction; no backend-specific code |
-| Test flakiness | Use fixed-size test data; not dependent on timing or concurrency |
+| #3060 | Added `with_result=false` + metadata-only task reads (this task builds on it) |
+| #3049 | Made serializer buffer capacity configurable (orthogonal) |
+| #2764 | Good First Issue list (self-proposed task model) |
 
-## Relationship to Existing Work
+---
 
-- **PR #3060**: Added `with_result=false` and metadata-only reads. This proposal builds on it by adding chunked storage for the `with_result=true` path.
-- **PR #3049**: Made serializer buffer capacity configurable. Orthogonal — addresses serialization buffer, not result storage.
+### Implementation Plan & Progress
 
-## Deliverables
+**Phase 1: Chunked Storage**
 
-1. Implementation in `HugeTask.java`, `TaskAPI.java`, `CoreOptions.java`
-2. Unit tests in `TaskCoreTest.java`
-3. API integration tests in `TaskApiTest.java`
-4. Feature verification: create Gremlin task with large result, verify chunked storage, verify paginated retrieval, verify small-result backward compatibility
+- [ ] **Chunk 1:** Add `task.result_chunk_size` config option to `CoreOptions.java` (default 1 MB, range 0-1 GB)
+- [ ] **Chunk 2:** Implement property name helpers (`hasChunkedResult()`, `chunkKey(int)`) in `HugeTask.java`
+- [ ] **Chunk 3:** Implement chunked write in `HugeTask.asArray()` — split result > threshold into `~task_result_N`
+- [ ] **Chunk 4:** Implement chunked read in `HugeTask.property()` — detect and reassemble `~task_result_N`
+- [ ] **Chunk 5:** Update `HugeTask.asMap()` for backward-compatible result output (both chunked and legacy)
+- [ ] **Chunk 6:** Add unit tests in `TaskCoreTest.java`: chunked storage, reassembly, small result backward compat
+
+**Phase 2: Paginated API**
+
+- [ ] **Chunk 7:** Add `page`, `pageSize` fields to `HugeTask` and pagination logic in `asMap()`
+- [ ] **Chunk 8:** Add `page`, `page_size` query params to `TaskAPI.get()`
+- [ ] **Chunk 9:** Add pagination metadata (`total`, `page`, `page_size`) to API response
+- [ ] **Chunk 10:** Add API integration tests in `TaskApiTest.java`
+
+**Phase 3: Validation**
+
+- [ ] **Chunk 11:** Manual verification: create Gremlin task with large result, verify chunked storage
+- [ ] **Chunk 12:** Manual verification: paginated retrieval via REST API (`page`/`page_size`)
+- [ ] **Chunk 13:** Run full test suite: `mvn test -pl hugegraph-server/hugegraph-test -am -P core-test,rocksdb`
