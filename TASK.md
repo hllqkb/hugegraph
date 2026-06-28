@@ -154,24 +154,266 @@ AFTER - Large Gremlin task result (> 16MB):
 
 ### Implementation Plan & Progress
 
-**Phase 1: Chunked Storage — HugeTask result serialization**
+Implementation Plan
+Breaking the work into independently reviewable and testable chunks. Each chunk has its own test, can be reviewed in isolation, and builds on the previous one.
 
-- [ ] **Chunk 1:** Add `task.result_chunk_size` config to `CoreOptions.java` — default `1048576` (1 MB), range `0` to `Bytes.GB`, `0` disables chunking → `hugegraph-core/.../config/CoreOptions.java`
-- [ ] **Chunk 2:** Add property name helpers to `HugeTask.java` — `chunkKey(int index)` returns `~task_result_N`, `isChunkedProperty(String key)` detects chunk keys, `chunkCountProperty()` returns the metadata marker key → `hugegraph-core/.../task/HugeTask.java`
-- [ ] **Chunk 3:** Add chunked write logic in `HugeTask.asArray()` — after compressing `this.result`, if size > `task.result_chunk_size`, split into chunks at JSON array element boundaries, write each as `~task_result_N` + a trailing chunk count marker → `hugegraph-core/.../task/HugeTask.java`
-- [ ] **Chunk 4:** Add chunked read logic in `HugeTask.property()` — detect chunk keys via `isChunkedProperty()`, collect all chunks, sort by index, decompress and concatenate, restore `this.result` → `hugegraph-core/.../task/HugeTask.java`
-- [ ] **Chunk 5:** Update `HugeTask.asMap()` — ensure `withResult=true` works for both chunked (reassembled from Chunk 4) and legacy single-property tasks → `hugegraph-core/.../task/HugeTask.java`
-- [ ] **Chunk 6:** Add unit tests — `testTaskResultChunked()` (large result → multiple properties), `testTaskResultSmall()` (small → single property), `testTaskResultChunkReassembly()` (chunks reassemble correctly), `testTaskResultBackwardCompat()` (old single-property task still readable) → `hugegraph-test/.../core/TaskCoreTest.java`
+---
 
-**Phase 2: Paginated API — REST endpoint pagination**
+**Chunk 1 — Add task.result_chunk_size config option**
 
-- [ ] **Chunk 7:** Add `page` and `pageSize` transient fields to `HugeTask` + pagination logic in `asMap(withResult, page, pageSize)` — apply `subList(start, end)` to the parsed result list, include `pagination` metadata map with `total`, `page`, `page_size` → `hugegraph-core/.../task/HugeTask.java`
-- [ ] **Chunk 8:** Add `page` (`@QueryParam("page")` default `-1`) and `page_size` (`@QueryParam("page_size")` default `-1`) to `TaskAPI.get()` — when both are `>= 0`, call `scheduler.task(id, withResult, page, pageSize)` → `hugegraph-api/.../api/job/TaskAPI.java`
-- [ ] **Chunk 9:** Add `task(Id id, boolean withResult, int page, int pageSize)` to `TaskScheduler` interface + `StandardTaskScheduler` — set pagination fields on the task before calling `asMap()` → `hugegraph-core/.../task/TaskScheduler.java` + `StandardTaskScheduler.java`
-- [ ] **Chunk 10:** Add API integration tests — `testGetWithPagination()` (verify `page`/`page_size` params work), `testGetPaginationMetadata()` (verify `total`/`page`/`page_size` in response), `testGetWithoutPagination()` (backward compat: no params → full result) → `hugegraph-test/.../api/TaskApiTest.java`
+File: `hugegraph-server/hugegraph-core/src/main/java/org/apache/hugegraph/config/CoreOptions.java`
 
-**Phase 3: Validation**
+Problem: No configuration exists to control result chunking behavior. The system always serializes and stores the entire task result as a single vertex property regardless of size.
 
-- [ ] **Chunk 11:** Manual verification — create Gremlin task with large result (e.g., `g.V().hasLabel(...).limit(100000).valueMap()`), verify task vertex has `~task_result_N` properties, verify reassembled result equals original
-- [ ] **Chunk 12:** Manual verification — paginated REST API: `GET /tasks/{id}?with_result=true&page=0&page_size=100`, verify first 100 items, then `page=1`, verify offset
-- [ ] **Chunk 13:** Run full test suite — `mvn test -pl hugegraph-server/hugegraph-test -am -P core-test,rocksdb` + `mvn test -pl hugegraph-server/hugegraph-test -am -P api-test,rocksdb`
+Fix: Add `TASK_RESULT_CHUNK_SIZE` static option with default `1048576` (1 MB), range `[0, Bytes.GB]`. Value `0` disables chunking entirely (preserves current behavior). Register the option in `registerOptions()`. The existing `TASK_RESULT_SIZE_LIMIT` (16 MB default) remains as the hard upper bound — chunking operates within this limit to avoid hitting per-property storage ceilings.
+
+```java
+public static final ConfigOption<Long> TASK_RESULT_CHUNK_SIZE =
+    ConfigOption.builder("task.result_chunk_size")
+                .description("Max size in bytes per result chunk. " +
+                             "0 disables chunking. Default 1MB.")
+                .range(0L, Bytes.GB)
+                .defaultValue(Bytes.MB)
+                .build();
+```
+
+Test: Verify option is registered and default value is 1 MB. Verify range validation rejects negative values and values > 1 GB.
+
+---
+
+**Chunk 2 — Add property name helpers to HugeTask**
+
+File: `hugegraph-server/hugegraph-core/src/main/java/org/apache/hugegraph/task/HugeTask.java`
+
+Problem: There is no infrastructure for naming, detecting, or counting chunked properties. All result properties are currently accessed via a single `P.RESULT` key.
+
+Fix: Add three static helper methods:
+- `chunkKey(int index)` — returns `"~task_result_" + index` for chunk properties; returns `P.RESULT` (`"~task_result"`) for `index < 0` (the legacy key)
+- `isChunkedProperty(String key)` — returns `true` if key matches `~task_result_` followed by one or more digits
+- `chunkCountKey()` — returns `"~task_result_count"`, a dedicated metadata property storing the number of chunks
+
+No behavior change — these are pure helpers used by subsequent chunks.
+
+Test: Verify key generation: `chunkKey(0)` → `"~task_result_0"`, `chunkKey(-1)` → `"~task_result"`. Verify `isChunkedProperty("~task_result_0")` → `true`, `isChunkedProperty("~task_result")` → `false`, `isChunkedProperty("~task_name")` → `false`.
+
+---
+
+**Chunk 3 — Implement chunked write in HugeTask.asArray()**
+
+File: `hugegraph-server/hugegraph-core/src/main/java/org/apache/hugegraph/task/HugeTask.java`
+
+Problem: `HugeTask.asArray()` (line 568) always writes the entire compressed result as a single `~task_result` vertex property, with no mechanism to split large results.
+
+Fix: After compressing `this.result` into `byte[] bytes`, check if chunking is enabled (`task.result_chunk_size > 0`) and the compressed size exceeds the threshold. If so:
+1. Decompress `bytes` back to the JSON string
+2. Parse the JSON string. If it's a JSON array, split along element boundaries so each chunk stays under the threshold without cutting elements in half. If it's a single object, split at byte boundaries.
+3. Compress each chunk individually
+4. Write `~task_result_0`, `~task_result_1`, ... `~task_result_N` to the property list
+5. Write `~task_result_count = N + 1` as a metadata marker
+
+If chunking is disabled or the result is below the threshold, the original single-property path runs unchanged.
+
+```java
+if (this.result != null) {
+    byte[] bytes = StringEncoding.compress(this.result);
+    long chunkSize = this.config.get(CoreOptions.TASK_RESULT_CHUNK_SIZE);
+    
+    if (chunkSize > 0 && bytes.length > chunkSize) {
+        // Chunked path
+        List<String> chunks = splitJsonArray(this.result, chunkSize);
+        for (int i = 0; i < chunks.size(); i++) {
+            list.add(chunkKey(i));
+            list.add(StringEncoding.compress(chunks.get(i)));
+        }
+        list.add(chunkCountKey());
+        list.add(chunks.size());
+    } else {
+        // Original single-property path
+        list.add(P.RESULT);
+        list.add(bytes);
+    }
+}
+```
+
+Test: Create a task with result string > 1 MB. Verify vertex has `~task_result_0` through `~task_result_N` properties plus `~task_result_count`. Verify small result (< 1 MB) still uses single `~task_result` property.
+
+---
+
+**Chunk 4 — Implement chunked read in HugeTask.property()**
+
+File: `hugegraph-server/hugegraph-core/src/main/java/org/apache/hugegraph/task/HugeTask.java`
+
+Problem: `HugeTask.property()` (line 463) only handles the single `P.RESULT` key. There is no logic to detect and reassemble chunked properties when loading a task from the backend.
+
+Fix: In `property(String key, Object value)`:
+1. When `key` matches `isChunkedProperty(key)`, collect the chunk value into a `List<String>` buffer (sorted by chunk index). 
+2. When `key` matches `chunkCountKey()`, record the expected chunk count.
+3. When all expected chunks have arrived (buffer size == chunk count), sort by index, decompress each, concatenate into the full JSON string, set `this.result`.
+4. When `key.equals(P.RESULT)`, handle as before (legacy single-property path).
+5. When `key` is not a chunk or result key, delegate to the existing property handling.
+
+Test: Verify chunked task can be loaded from backend — `this.result` is correctly reassembled. Verify legacy single-property task still loads correctly. Verify partial chunk load (e.g., task still being written) does not produce corrupted result.
+
+---
+
+**Chunk 5 — Update HugeTask.asMap() for chunked/legacy compatibility**
+
+File: `hugegraph-server/hugegraph-core/src/main/java/org/apache/hugegraph/task/HugeTask.java`
+
+Problem: `HugeTask.asMap()` (line 628) calls `this.result()` to get the stored result string. This path must work identically whether the underlying storage is chunked or legacy single-property.
+
+Fix: No code change needed here if Chunk 4 correctly restores `this.result` during `property()` processing. The `asMap()` method's existing `this.result()` call will return the full reassembled result. Add a guard: if chunked result is being reassembled (buffer not yet complete), `this.result()` should return `null` until all chunks are loaded.
+
+This is primarily a verification chunk: confirm the existing `asMap()` logic works through the chunked read path from Chunk 4.
+
+Test: Verify `asMap(true, true)` returns full result for chunked task. Verify `asMap(true, false)` (the `with_result=false` path from #3060) returns metadata without result for chunked task. Verify `asMap()` with legacy single-property task still works.
+
+---
+
+**Chunk 6 — Add unit tests for chunked storage**
+
+File: `hugegraph-server/hugegraph-test/src/main/java/org/apache/hugegraph/core/TaskCoreTest.java`
+
+Problem: No test coverage for chunked result storage, reassembly, or backward compatibility.
+
+Fix: Add four test methods:
+- `testTaskResultChunked()` — create task with result JSON string > 1 MB. Verify task vertex stores `~task_result_0`, `~task_result_1`, ... plus `~task_result_count`. Verify `task.result()` returns the full reassembled result.
+- `testTaskResultSmall()` — create task with result < 1 MB. Verify task vertex stores single `~task_result` property (backward compat). Verify `task.result()` returns correct value.
+- `testTaskResultChunkReassembly()` — create task with known result, verify reassembled result equals original exactly (byte-level).
+- `testTaskResultBackwardCompat()` — directly construct a task vertex with legacy single `~task_result` property. Load it. Verify `task.result()` works.
+- `testTaskResultChunkDisabled()` — set `task.result_chunk_size` to `0`. Create large task. Verify single-property path used.
+
+Test data: Generate result strings of known sizes using a helper method that creates a JSON array with N elements, e.g., `["result-item-00000", "result-item-00001", ...]`.
+
+---
+
+**Chunk 7 — Add pagination fields and logic to HugeTask**
+
+File: `hugegraph-server/hugegraph-core/src/main/java/org/apache/hugegraph/task/HugeTask.java`
+
+Problem: `HugeTask` has no concept of pagination. The entire result is always returned.
+
+Fix: Add two transient fields: `private int page = -1` and `private int pageSize = -1`. When both are `>= 0`, `asMap(true, true)` should apply pagination:
+1. Parse `this.result` into a list of objects (the Gremlin result is always a list)
+2. Compute `start = page * pageSize`, `end = Math.min(start + pageSize, list.size())`
+3. Return `list.subList(start, end)` as the result
+4. Include a `pagination` metadata map: `{"page": page, "page_size": pageSize, "total": list.size()}`
+5. When both fields are `-1` (default), return the full result — backward compatible
+
+6. Add getter/setter for `page` and `pageSize`.
+
+Test: Verify pagination with known list size: page=0, pageSize=10 returns first 10 items. page=2, pageSize=10 returns items 20-29. Verify metadata shows correct total. Verify page=-1 returns all items.
+
+---
+
+**Chunk 8 — Add page and page_size query params to TaskAPI.get()**
+
+File: `hugegraph-server/hugegraph-api/src/main/java/org/apache/hugegraph/api/job/TaskAPI.java`
+
+Problem: `GET /tasks/{id}` has no pagination query parameters.
+
+Fix: Add two new `@QueryParam` annotations to the existing `get()` method:
+```java
+@QueryParam("page") @DefaultValue("-1") int page,
+@QueryParam("page_size") @DefaultValue("-1") int pageSize
+```
+When both `page >= 0` and `pageSize >= 0`, pass them to the task before calling `asMap()`:
+```java
+HugeTask<?> task = scheduler.task(IdGenerator.of(id), withResult);
+if (page >= 0 && pageSize >= 0) {
+    task.page(page);
+    task.pageSize(pageSize);
+}
+return task.asMap(true, withResult);
+```
+When either is `-1` (default), behavior is unchanged — full result returned.
+
+Test: Verify `GET /tasks/{id}?with_result=true&page=0&page_size=10` returns first page. Verify `GET /tasks/{id}?with_result=true` (no pagination params) returns full result. Verify `GET /tasks/{id}?with_result=false&page=0&page_size=10` does not include result (metadata-only takes precedence).
+
+---
+
+**Chunk 9 — Add task(Id, boolean, int, int) overload to TaskScheduler**
+
+File: `hugegraph-server/hugegraph-core/src/main/java/org/apache/hugegraph/task/TaskScheduler.java` (interface) + `StandardTaskScheduler.java` (implementation)
+
+Problem: The `TaskScheduler.task(Id, boolean withResult)` method has no way to pass pagination parameters to the task. The current workaround uses setters on the returned task object, but this creates a race condition if the task's `asMap()` is called before the setters execute.
+
+Fix: Add a new overload:
+```java
+// Interface
+<V> HugeTask<V> task(Id id, boolean withResult, int page, int pageSize);
+
+// Implementation (StandardTaskScheduler)
+@Override
+public <V> HugeTask<V> task(Id id, boolean withResult, int page, int pageSize) {
+    HugeTask<V> task = this.task(id, withResult);
+    if (page >= 0 && pageSize >= 0) {
+        task.page(page);
+        task.pageSize(pageSize);
+    }
+    return task;
+}
+```
+Update `TaskAPI.get()` (Chunk 8) to use this overload instead of manual setter calls.
+
+Test: Verify `task(123, true, 0, 10).asMap(true, true)` returns first 10 results with pagination metadata.
+
+---
+
+**Chunk 10 — Add API integration tests for pagination**
+
+File: `hugegraph-server/hugegraph-test/src/main/java/org/apache/hugegraph/api/TaskApiTest.java`
+
+Problem: No test coverage for paginated result retrieval via REST API.
+
+Fix: Add three test methods:
+- `testGetWithPagination()` — create a Gremlin task that returns 100 items. Call `GET /tasks/{id}?with_result=true&page=0&page_size=30`. Assert 30 items returned. Call `page=3&page_size=30`. Assert 10 items returned (last page has remainder). 
+- `testGetPaginationMetadata()` — create task with known result. Verify response includes `pagination` object with correct `total`, `page`, `page_size`.
+- `testGetWithoutPagination()` — create task with pagination-capable result. Call without `page`/`page_size` params. Assert full result returned (backward compat — no pagination object present).
+- `testGetInvalidPage()` — call with `page=-1&page_size=10`. Verify full result returned (graceful fallback).
+
+---
+
+**Chunk 11 — Manual verification: chunked storage**
+
+Manual test procedure (no automated test — verifies the full end-to-end storage path):
+
+1. Start HugeGraph server with RocksDB backend
+2. Create a schema and insert test data (e.g., 50K vertices with labels)
+3. Submit a Gremlin async task: `g.V().hasLabel("test").valueMap()`
+4. Wait for task to SUCCESS
+5. Inspect task vertex properties via `GET /graphs/hugegraph/graph/vertices/{task_id}` (raw vertex API or debug log)
+6. Verify `~task_result_0`, `~task_result_1`, ... `~task_result_N` exist (if > 1 MB) or single `~task_result` exists (if ≤ 1 MB)
+7. Verify `~task_result_count` = N + 1 (if chunked)
+8. Run `GET /tasks/{id}?with_result=true` and verify the full result equals the query result
+
+---
+
+**Chunk 12 — Manual verification: paginated REST API**
+
+Manual test procedure:
+
+1. Use the task from Chunk 11 (with chunked result)
+2. `GET /tasks/{id}?with_result=true&page=0&page_size=100` → verify first 100 items
+3. `GET /tasks/{id}?with_result=true&page=1&page_size=100` → verify items 100-199 (different from page 0)
+4. `GET /tasks/{id}?with_result=true&page=999&page_size=100` → verify empty array returned with correct `total`
+5. `GET /tasks/{id}?with_result=true` (no pagination) → verify full result, no `pagination` key in response
+6. Verify each page response includes `pagination: { page, page_size, total }`
+
+---
+
+**Chunk 13 — Run full test suite**
+
+Commands:
+```bash
+# Core tests (task framework)
+mvn test -pl hugegraph-server/hugegraph-test -am -P core-test,rocksdb
+
+# API tests (REST endpoints)
+mvn test -pl hugegraph-server/hugegraph-test -am -P api-test,rocksdb
+
+# Full test suite
+mvn test -pl hugegraph-server/hugegraph-test -am -P core-test,api-test,rocksdb
+```
+
+Expected: All existing tests pass. New tests from Chunk 6 and Chunk 10 pass. No regressions in unrelated tests.
