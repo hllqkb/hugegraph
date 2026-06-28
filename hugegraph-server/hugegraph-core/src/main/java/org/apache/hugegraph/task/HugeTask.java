@@ -18,6 +18,7 @@
 package org.apache.hugegraph.task;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
@@ -61,6 +62,57 @@ public class HugeTask<V> extends FutureTask<V> {
 
     private static final float DECOMPRESS_RATIO = 10.0F;
 
+    private static final String RESULT_CHUNK_PREFIX = "~task_result_";
+
+    public static String chunkKey(int index) {
+        if (index < 0) {
+            return P.RESULT;
+        }
+        return RESULT_CHUNK_PREFIX + index;
+    }
+
+    public static boolean isChunkedProperty(String key) {
+        if (key == null || !key.startsWith(RESULT_CHUNK_PREFIX)) {
+            return false;
+        }
+        String suffix = key.substring(RESULT_CHUNK_PREFIX.length());
+        if (suffix.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < suffix.length(); i++) {
+            if (!Character.isDigit(suffix.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static int chunkIndex(String key) {
+        return Integer.parseInt(key.substring(RESULT_CHUNK_PREFIX.length()));
+    }
+
+    private String reassembleResult() {
+        if (this.resultChunks == null || this.resultChunkCount <= 0) {
+            return null;
+        }
+        int totalLen = 0;
+        for (byte[] chunk : this.resultChunks.values()) {
+            totalLen += chunk.length;
+        }
+        byte[] all = new byte[totalLen];
+        int offset = 0;
+        for (int i = 0; i < this.resultChunkCount; i++) {
+            byte[] chunk = this.resultChunks.get(i);
+            if (chunk == null) {
+                throw new HugeException(
+                    "Missing chunk %d for task result reassembly", i);
+            }
+            System.arraycopy(chunk, 0, all, offset, chunk.length);
+            offset += chunk.length;
+        }
+        return StringEncoding.decompress(all, DECOMPRESS_RATIO);
+    }
+
     private transient TaskScheduler scheduler = null;
 
     private final TaskCallable<V> callable;
@@ -82,6 +134,10 @@ public class HugeTask<V> extends FutureTask<V> {
     private volatile int retries;
     private volatile String input;
     private volatile String result;
+
+    // Chunked result buffering (transient — only used during load)
+    private transient Map<Integer, byte[]> resultChunks;
+    private transient int resultChunkCount = -1;
 
     public HugeTask(Id id, Id parent, String callable, String input) {
         this(id, parent, TaskCallable.fromClass(callable));
@@ -450,6 +506,27 @@ public class HugeTask<V> extends FutureTask<V> {
 
     protected void property(String key, Object value) {
         E.checkNotNull(key, "property key");
+        // Handle chunked result properties before the switch
+        if (isChunkedProperty(key)) {
+            if (this.resultChunks == null) {
+                this.resultChunks = new HashMap<>();
+            }
+            int idx = chunkIndex(key);
+            this.resultChunks.put(idx, ((Blob) value).bytes());
+            if (this.resultChunkCount > 0 &&
+                this.resultChunks.size() == this.resultChunkCount) {
+                this.result = reassembleResult();
+            }
+            return;
+        }
+        if (key.equals(P.RESULT_CHUNK_COUNT)) {
+            this.resultChunkCount = (int) value;
+            if (this.resultChunks != null &&
+                this.resultChunks.size() == this.resultChunkCount) {
+                this.result = reassembleResult();
+            }
+            return;
+        }
         switch (key) {
             case P.TYPE:
                 this.type = (String) value;
@@ -567,9 +644,28 @@ public class HugeTask<V> extends FutureTask<V> {
 
         if (this.result != null) {
             byte[] bytes = StringEncoding.compress(this.result);
-            checkPropertySize(bytes.length, P.RESULT);
-            list.add(P.RESULT);
-            list.add(bytes);
+            HugeGraph graph = this.scheduler().graph();
+            long chunkSize = graph.option(CoreOptions.TASK_RESULT_CHUNK_SIZE);
+
+            if (chunkSize > 0 && bytes.length > chunkSize) {
+                // Chunked path — byte-level split of compressed data
+                int chunkCount = (int) Math.ceil((double) bytes.length /
+                                                 (double) chunkSize);
+                for (int i = 0; i < chunkCount; i++) {
+                    int start = i * (int) chunkSize;
+                    int end = Math.min(start + (int) chunkSize,
+                                       bytes.length);
+                    list.add(chunkKey(i));
+                    list.add(Arrays.copyOfRange(bytes, start, end));
+                }
+                list.add(P.RESULT_CHUNK_COUNT);
+                list.add(chunkCount);
+            } else {
+                // Original single-property path
+                checkPropertySize(bytes.length, P.RESULT);
+                list.add(P.RESULT);
+                list.add(bytes);
+            }
         }
 
         if (this.server != null) {
@@ -650,15 +746,21 @@ public class HugeTask<V> extends FutureTask<V> {
     }
 
     public Map<String, Object> asMap() {
-        return this.asMap(true);
+        return this.asMap(true, true, -1, -1);
     }
 
     public synchronized Map<String, Object> asMap(boolean withDetails) {
-        return this.asMap(withDetails, true);
+        return this.asMap(withDetails, true, -1, -1);
     }
 
     public synchronized Map<String, Object> asMap(boolean withDetails,
                                                   boolean withResult) {
+        return this.asMap(withDetails, withResult, -1, -1);
+    }
+
+    public synchronized Map<String, Object> asMap(boolean withDetails,
+                                                  boolean withResult,
+                                                  int page, int pageSize) {
         E.checkState(this.type != null, "Task type can't be null");
         E.checkState(this.name != null, "Task name can't be null");
 
@@ -696,7 +798,21 @@ public class HugeTask<V> extends FutureTask<V> {
                 map.put(Hidden.unHide(P.INPUT), this.input);
             }
             if (withResult && this.result != null) {
-                map.put(Hidden.unHide(P.RESULT), this.result);
+                Object parsed = JsonUtil.fromJson(this.result, Object.class);
+                if (page >= 0 && pageSize > 0 && parsed instanceof List) {
+                    @SuppressWarnings("unchecked")
+                    List<Object> list = (List<Object>) parsed;
+                    int from = page * pageSize;
+                    int to = Math.min(from + pageSize, list.size());
+                    map.put(Hidden.unHide(P.RESULT), list.subList(from, to));
+                    Map<String, Object> pagination = new HashMap<>();
+                    pagination.put("page", page);
+                    pagination.put("page_size", pageSize);
+                    pagination.put("total", list.size());
+                    map.put("pagination", pagination);
+                } else {
+                    map.put(Hidden.unHide(P.RESULT), parsed);
+                }
             }
         }
 
@@ -746,7 +862,9 @@ public class HugeTask<V> extends FutureTask<V> {
         for (Iterator<VertexProperty<Object>> iter = vertex.properties();
              iter.hasNext(); ) {
             VertexProperty<Object> prop = iter.next();
-            if (!withResult && P.RESULT.equals(prop.key())) {
+            if (!withResult && (P.RESULT.equals(prop.key()) ||
+                isChunkedProperty(prop.key()) ||
+                P.RESULT_CHUNK_COUNT.equals(prop.key()))) {
                 continue;
             }
             task.property(prop.key(), prop.value());
@@ -851,6 +969,7 @@ public class HugeTask<V> extends FutureTask<V> {
         public static final String RETRIES = "~task_retries";
         public static final String INPUT = "~task_input";
         public static final String RESULT = "~task_result";
+        public static final String RESULT_CHUNK_COUNT = "~task_result_chunk_count";
         public static final String DEPENDENCIES = "~task_dependencies";
         public static final String SERVER = "~task_server";
 

@@ -141,13 +141,21 @@ public class TaskAPI extends API {
                                    @Parameter(description = "Whether to load task result")
                                    @DefaultValue("true")
                                    @QueryParam("with_result")
-                                   boolean withResult) {
+                                   boolean withResult,
+                                   @Parameter(description = "The page number (0-based)")
+                                   @DefaultValue("-1")
+                                   @QueryParam("page")
+                                   int page,
+                                   @Parameter(description = "The page size")
+                                   @DefaultValue("-1")
+                                   @QueryParam("page_size")
+                                   int pageSize) {
         LOG.debug("Graph [{}] get task: {}", graph, id);
 
         TaskScheduler scheduler = graph(manager, graphSpace, graph)
                 .taskScheduler();
         return scheduler.task(IdGenerator.of(id), withResult)
-                        .asMap(true, withResult);
+                        .asMap(true, withResult, page, pageSize);
     }
 
     @DELETE

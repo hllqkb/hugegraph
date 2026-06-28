@@ -306,6 +306,16 @@ public class CoreOptions extends OptionHolder {
                     rangeInt(0L, Bytes.GB),
                     16 * Bytes.MB
             );
+    public static final ConfigOption<Long> TASK_RESULT_CHUNK_SIZE =
+            new ConfigOption<>(
+                    "task.result_chunk_size",
+                    "Max size in bytes per result chunk. " +
+                    "0 disables chunking. Default 1MB. " +
+                    "Max is BYTES_LEN_MAX (10MB) since each " +
+                    "chunk is a single vertex property.",
+                    rangeInt(0L, BytesBuffer.BYTES_LEN_MAX),
+                    Bytes.MB
+            );
     public static final ConfigOption<Integer> TASK_TTL_DELETE_BATCH =
             new ConfigOption<>(
                     "task.ttl_delete_batch",

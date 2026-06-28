@@ -18,7 +18,10 @@
 package org.apache.hugegraph.core;
 
 import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.TimeoutException;
 
@@ -27,22 +30,30 @@ import org.apache.hugegraph.HugeGraph;
 import org.apache.hugegraph.api.job.GremlinAPI.GremlinRequest;
 import org.apache.hugegraph.backend.id.Id;
 import org.apache.hugegraph.backend.id.IdGenerator;
+import org.apache.hugegraph.config.CoreOptions;
+import org.apache.hugegraph.config.HugeConfig;
 import org.apache.hugegraph.exception.NotFoundException;
 import org.apache.hugegraph.job.EphemeralJob;
 import org.apache.hugegraph.job.EphemeralJobBuilder;
 import org.apache.hugegraph.job.GremlinJob;
 import org.apache.hugegraph.job.JobBuilder;
+import org.apache.hugegraph.job.UserJob;
 import org.apache.hugegraph.task.HugeTask;
 import org.apache.hugegraph.task.TaskCallable;
 import org.apache.hugegraph.task.TaskScheduler;
 import org.apache.hugegraph.task.TaskStatus;
 import org.apache.hugegraph.testutil.Assert;
 import org.apache.hugegraph.testutil.Whitebox;
+import org.apache.hugegraph.util.Blob;
+import org.apache.hugegraph.util.JsonUtil;
+import org.apache.hugegraph.util.StringEncoding;
 import org.junit.Before;
 import org.junit.Test;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import org.apache.tinkerpop.gremlin.structure.Vertex;
+import org.apache.tinkerpop.gremlin.structure.VertexProperty;
 
 public class TaskCoreTest extends BaseCoreTest {
 
@@ -56,7 +67,17 @@ public class TaskCoreTest extends BaseCoreTest {
 
         Iterator<HugeTask<Object>> iter = scheduler.tasks(null, -1, null);
         while (iter.hasNext()) {
-            scheduler.delete(iter.next().id(), false);
+            HugeTask<Object> t = iter.next();
+            try {
+                scheduler.cancel(t);
+            } catch (Exception ignored) {
+                // Task may already be completed
+            }
+            try {
+                scheduler.delete(t.id(), true);
+            } catch (Exception ignored) {
+                // Task may be running on another node
+            }
         }
     }
 
@@ -753,6 +774,145 @@ public class TaskCoreTest extends BaseCoreTest {
         Assert.assertEquals("100", task2.result());
     }
 
+    @Test
+    public void testTaskResultChunked() throws TimeoutException {
+        HugeGraph graph = graph();
+        TaskScheduler scheduler = graph.taskScheduler();
+
+        // Set very low chunk size to force chunking even with modest result
+        HugeConfig config = (HugeConfig) Whitebox.getInternalState(graph, "configuration");
+        Long originalChunkSize = config.get(CoreOptions.TASK_RESULT_CHUNK_SIZE);
+        config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(), 50L);
+
+        try {
+            String testData = generateTestData(200);
+            String expectedResult = JsonUtil.toJson(testData);
+
+            HugeTask<Object> task = runStringJob(testData);
+            task = scheduler.waitUntilTaskCompleted(task.id(), 10);
+
+            Assert.assertEquals(TaskStatus.SUCCESS, task.status());
+            Assert.assertEquals(expectedResult, task.result());
+
+        } finally {
+            config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(),
+                               originalChunkSize);
+        }
+    }
+
+    @Test
+    public void testTaskResultSmall() throws TimeoutException {
+        HugeGraph graph = graph();
+        TaskScheduler scheduler = graph.taskScheduler();
+
+        // Small result uses single-property path with default chunk size (1MB)
+        String smallData = "small-result";
+        String expectedResult = JsonUtil.toJson(smallData);
+
+        HugeTask<Object> task = runStringJob(smallData);
+        task = scheduler.waitUntilTaskCompleted(task.id(), 10);
+
+        Assert.assertEquals(TaskStatus.SUCCESS, task.status());
+        Assert.assertEquals(expectedResult, task.result());
+
+    }
+
+    @Test
+    public void testTaskResultChunkReassembly() throws TimeoutException {
+        HugeGraph graph = graph();
+        TaskScheduler scheduler = graph.taskScheduler();
+
+        HugeConfig config = (HugeConfig) Whitebox.getInternalState(graph, "configuration");
+        Long originalChunkSize = config.get(CoreOptions.TASK_RESULT_CHUNK_SIZE);
+        config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(), 50L);
+
+        try {
+            String testData = generateTestData(200);
+            String expectedResult = JsonUtil.toJson(testData);
+
+            HugeTask<Object> task = runStringJob(testData);
+            task = scheduler.waitUntilTaskCompleted(task.id(), 10);
+
+            Assert.assertEquals(TaskStatus.SUCCESS, task.status());
+            Assert.assertEquals("Reassembled result should match",
+                                expectedResult, task.result());
+
+        } finally {
+            config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(),
+                               originalChunkSize);
+        }
+    }
+
+    @Test
+    public void testTaskResultBackwardCompat() throws TimeoutException {
+        HugeGraph graph = graph();
+        TaskScheduler scheduler = graph.taskScheduler();
+
+        // Set chunk size to 0 to force legacy single-property path
+        HugeConfig config = (HugeConfig) Whitebox.getInternalState(graph, "configuration");
+        Long originalChunkSize = config.get(CoreOptions.TASK_RESULT_CHUNK_SIZE);
+        config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(), 0L);
+
+        try {
+            String testData = "legacy-backward-compat-data";
+            String expectedResult = JsonUtil.toJson(testData);
+
+            HugeTask<Object> task = runStringJob(testData);
+            task = scheduler.waitUntilTaskCompleted(task.id(), 10);
+
+            Assert.assertEquals(TaskStatus.SUCCESS, task.status());
+            Assert.assertEquals(expectedResult, task.result());
+
+            // Restore default settings
+            config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(),
+                               originalChunkSize);
+        } catch (TimeoutException e) {
+            config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(),
+                               originalChunkSize);
+            throw e;
+        }
+    }
+
+    @Test
+    public void testTaskResultChunkDisabled() throws TimeoutException {
+        HugeGraph graph = graph();
+        TaskScheduler scheduler = graph.taskScheduler();
+
+        HugeConfig config = (HugeConfig) Whitebox.getInternalState(graph, "configuration");
+        Long originalChunkSize = config.get(CoreOptions.TASK_RESULT_CHUNK_SIZE);
+        config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(), 0L);
+
+        try {
+            String testData = generateTestData(200);
+            String expectedResult = JsonUtil.toJson(testData);
+
+            HugeTask<Object> task = runStringJob(testData);
+            task = scheduler.waitUntilTaskCompleted(task.id(), 10);
+
+            Assert.assertEquals(TaskStatus.SUCCESS, task.status());
+            Assert.assertEquals(expectedResult, task.result());
+
+        } finally {
+            config.setProperty(CoreOptions.TASK_RESULT_CHUNK_SIZE.name(),
+                               originalChunkSize);
+        }
+    }
+
+    /**
+     * Generate a non-repetitive test data string of approximately the given size.
+     * Uses a rotating character set to avoid excessive LZ4 compression.
+     */
+    private static String generateTestData(int targetSize) {
+        StringBuilder sb = new StringBuilder(targetSize);
+        String chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        int ci = 0;
+        while (sb.length() < targetSize) {
+            sb.append(chars.charAt(ci % chars.length()));
+            ci++;
+        }
+        return sb.toString();
+    }
+
     private HugeTask<Object> runGremlinJob(String gremlin) {
         HugeGraph graph = graph();
 
@@ -812,5 +972,41 @@ public class TaskCoreTest extends BaseCoreTest {
         public void done() {
             this.graph().taskScheduler().save(this.task());
         }
+    }
+
+    public static class StringCallable extends UserJob<Object> {
+
+        private final String value;
+
+        public StringCallable(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public Object execute() {
+            return this.value;
+        }
+
+        @Override
+        public String type() {
+            return "test-string";
+        }
+    }
+
+    private HugeTask<Object> runStringJob(String result) {
+        HugeGraph graph = graph();
+        EphemeralJobBuilder<Object> builder = EphemeralJobBuilder.of(graph);
+        builder.name("test-string-job")
+               .job(new EphemeralJob<Object>() {
+                   @Override
+                   public String type() {
+                       return "test-string";
+                   }
+                   @Override
+                   public Object execute() {
+                       return result;
+                   }
+               });
+        return builder.schedule();
     }
 }

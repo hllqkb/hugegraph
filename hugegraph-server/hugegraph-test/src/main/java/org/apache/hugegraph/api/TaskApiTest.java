@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.hugegraph.testutil.Assert;
+import org.apache.hugegraph.util.JsonUtil;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -185,5 +186,100 @@ public class TaskApiTest extends BaseApiTest {
         } catch (InterruptedException e) {
             // ignore
         }
+    }
+
+    @Test
+    public void testGetWithPagination() {
+        // Create a Gremlin task that returns a list of 100 items (0..99)
+        int taskId = this.gremlinJob("(0..99).toList()");
+        waitTaskSuccess(taskId);
+
+        // Get first page (page=0, page_size=30)
+        Response r = client().get(PATH + taskId,
+                                 ImmutableMap.of("with_result", true,
+                                                 "page", 0,
+                                                 "page_size", 30));
+        String content = assertResponseStatus(200, r);
+        List<?> result = assertJsonContains(content, "task_result");
+        Assert.assertEquals(30, result.size());
+        Assert.assertEquals(0, result.get(0));
+        Assert.assertEquals(29, result.get(29));
+
+        // Get last page (page=3, page_size=30) - should have 10 remaining items
+        r = client().get(PATH + taskId,
+                        ImmutableMap.of("with_result", true,
+                                        "page", 3,
+                                        "page_size", 30));
+        content = assertResponseStatus(200, r);
+        result = assertJsonContains(content, "task_result");
+        Assert.assertEquals(10, result.size());
+        Assert.assertEquals(90, result.get(0));
+        Assert.assertEquals(99, result.get(9));
+    }
+
+    @Test
+    public void testGetWithoutPagination() {
+        // Create a Gremlin task that returns a list of 100 items
+        int taskId = this.gremlinJob("(0..99).toList()");
+        waitTaskSuccess(taskId);
+
+        // GET without page/page_size params - should get full result
+        Response r = client().get(PATH + taskId,
+                                 ImmutableMap.of("with_result", true));
+        String content = assertResponseStatus(200, r);
+
+        List<?> result = assertJsonContains(content, "task_result");
+        Assert.assertEquals(100, result.size());
+
+        // Verify no 'pagination' key in response
+        Map<?, ?> map = JsonUtil.fromJson(content, Map.class);
+        Assert.assertFalse("Response should not contain 'pagination' key",
+                          map.containsKey("pagination"));
+    }
+
+    @Test
+    public void testGetPaginationMetadata() {
+        // Create a Gremlin task that returns exactly 100 items
+        int taskId = this.gremlinJob("(0..99).toList()");
+        waitTaskSuccess(taskId);
+
+        Response r = client().get(PATH + taskId,
+                                 ImmutableMap.of("with_result", true,
+                                                 "page", 0,
+                                                 "page_size", 30));
+        String content = assertResponseStatus(200, r);
+
+        // Verify pagination metadata
+        Map<?, ?> pagination = assertJsonContains(content, "pagination");
+        Assert.assertEquals(100, ((Number) pagination.get("total")).intValue());
+        Assert.assertEquals(0, ((Number) pagination.get("page")).intValue());
+        Assert.assertEquals(30, ((Number) pagination.get("page_size")).intValue());
+
+        // Verify first page content size is correct
+        List<?> result = assertJsonContains(content, "task_result");
+        Assert.assertEquals(30, result.size());
+    }
+
+    @Test
+    public void testGetInvalidPage() {
+        // Create a Gremlin task that returns a list of items
+        int taskId = this.gremlinJob("(0..99).toList()");
+        waitTaskSuccess(taskId);
+
+        // GET with page=-1&page_size=10 - should fallback to full result
+        Response r = client().get(PATH + taskId,
+                                 ImmutableMap.of("with_result", true,
+                                                 "page", -1,
+                                                 "page_size", 10));
+        String content = assertResponseStatus(200, r);
+
+        // Should return full result (all 100 items, not paginated)
+        List<?> result = assertJsonContains(content, "task_result");
+        Assert.assertEquals(100, result.size());
+
+        // Should not have pagination key
+        Map<?, ?> map = JsonUtil.fromJson(content, Map.class);
+        Assert.assertFalse("Response should not contain 'pagination' key",
+                          map.containsKey("pagination"));
     }
 }

@@ -145,6 +145,7 @@ public class StandardHugeGraph implements HugeGraph {
             CoreOptions.TASK_TTL_DELETE_BATCH,
             CoreOptions.TASK_INPUT_SIZE_LIMIT,
             CoreOptions.TASK_RESULT_SIZE_LIMIT,
+            CoreOptions.TASK_RESULT_CHUNK_SIZE,
             CoreOptions.OLTP_CONCURRENT_THREADS,
             CoreOptions.OLTP_CONCURRENT_DEPTH,
             CoreOptions.OLTP_COLLECTION_TYPE,
